@@ -844,6 +844,56 @@ impl Position {
         pinned
     }
 
+    /// 王手されているとき、玉以外の駒の移動・駒打ちで王手を解消できる升の集合
+    /// （王手駒の升と、飛び駒の王手なら玉との間の升）。両王手なら 0。
+    pub fn evasion_mask(&self) -> u128 {
+        let t = tables();
+        let us = self.side;
+        let them = us ^ 1;
+        let ksq = self.king_sq[us];
+        let occ = self.occ[0] | self.occ[1];
+        let mut mask = 0u128;
+        let mut n = 0;
+        for d in 0..8 {
+            let blockers = t.ray_mask[ksq][d] & occ;
+            if blockers == 0 {
+                continue;
+            }
+            let f = first_blocker(blockers, d);
+            let p = self.board[f];
+            if color_of(p) != them {
+                continue;
+            }
+            let od = 7 - d;
+            let pt = ptype(p) as usize;
+            if f == t.ray[ksq][d][0] as usize && (t.step_mask[them][pt] | t.slide_mask[them][pt]) & (1 << od) != 0 {
+                mask |= 1u128 << f;
+                n += 1;
+            } else if t.slide_mask[them][pt] & (1 << od) != 0 {
+                mask |= t.ray_mask[ksq][d] & !t.ray_mask[f][d];
+                n += 1;
+            }
+        }
+        let r0 = (ksq / 9) as i32;
+        let c0 = (ksq % 9) as i32;
+        let kr = if them == BLACK { r0 + 2 } else { r0 - 2 };
+        if (0..9).contains(&kr) {
+            let kn = make_piece(them, KNIGHT);
+            for dc in [-1i32, 1] {
+                let c = c0 + dc;
+                if (0..9).contains(&c) && self.board[(kr * 9 + c) as usize] == kn {
+                    mask |= 1u128 << (kr * 9 + c);
+                    n += 1;
+                }
+            }
+        }
+        if n >= 2 {
+            0
+        } else {
+            mask
+        }
+    }
+
     #[inline]
     pub fn in_check(&self) -> bool {
         self.is_attacked(self.king_sq[self.side], self.side ^ 1)

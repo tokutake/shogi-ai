@@ -269,25 +269,29 @@ impl Searcher {
     }
 
     /// 疑似合法手を指して、合法なら true（不合法なら戻して false）
+    /// safe = 王手されていない。王手されているときは evasion = pos.evasion_mask()、pinned も計算済みであること
     #[inline]
-    fn try_move(&mut self, pos: &mut Position, m: Move, safe: bool, pinned: u128) -> bool {
-        // 王手されておらず、玉でも pin された駒でもない手は必ず合法（歩打ちは打ち歩詰めのため別扱い）
-        if safe && !(mv_is_drop(m) && mv_drop_pt(m) == PAWN) {
-            if mv_is_drop(m) {
-                pos.do_move(m);
-                return true;
+    fn try_move(&mut self, pos: &mut Position, m: Move, safe: bool, pinned: u128, evasion: u128) -> bool {
+        let is_pawn_drop = mv_is_drop(m) && mv_drop_pt(m) == PAWN;
+        let is_king = !mv_is_drop(m) && ptype(pos.board[mv_from(m)]) == KING;
+        if !safe && !is_king {
+            // 王手中: 玉以外は王手駒を取るか間に入る手しか合法でない
+            if evasion >> mv_to(m) & 1 == 0 {
+                return false;
             }
-            let from = mv_from(m);
-            if ptype(pos.board[from]) != KING && pinned >> from & 1 == 0 {
+        }
+        // 玉でも pin された駒でもない手は必ず合法（王手中は上の条件を満たすもの。歩打ちは打ち歩詰めのため別扱い）
+        if !is_pawn_drop && !is_king {
+            if mv_is_drop(m) || pinned >> mv_from(m) & 1 == 0 {
                 pos.do_move(m);
                 return true;
             }
         }
-        if mv_is_drop(m) && mv_drop_pt(m) == PAWN {
+        if is_pawn_drop {
             // 打ち歩詰めになりうるのは敵玉の頭に打つ歩だけ
             let to = mv_to(m);
             let head = if pos.side == BLACK { to == pos.king_sq[pos.side ^ 1] + 9 } else { to + 9 == pos.king_sq[pos.side ^ 1] };
-            if safe && !head {
+            if !head {
                 pos.do_move(m);
                 return true;
             }
@@ -385,19 +389,25 @@ impl Searcher {
         let mut moves = std::mem::take(&mut self.move_bufs[ply]);
         moves.clear();
         pos.pseudo_moves(&mut moves, false);
+        let evasion = if in_check { pos.evasion_mask() } else { 0 };
+        if in_check {
+            // 王手を解消しない手（玉以外で王手駒を取らず間にも入らない手）は並べ替えの前に除く
+            let ksq = pos.king_sq[pos.side];
+            moves.retain(|&m| evasion >> mv_to(m) & 1 != 0 || (!mv_is_drop(m) && mv_from(m) == ksq));
+        }
         self.order_moves(pos, &mut moves, tt_move, ply, false);
 
         let orig_alpha = alpha;
         let mut best_score = -INF;
         let mut best_move = NO_MOVE;
         let mut legal = 0;
-        let pinned = if in_check { 0 } else { pos.pinned_mask() };
+        let pinned = pos.pinned_mask();
         let mut quiets_tried = std::mem::take(&mut self.quiet_bufs[ply]);
         quiets_tried.clear();
         for &m in moves.iter() {
             let quiet = !mv_is_promo(m) && (mv_is_drop(m) || pos.board[mv_to(m)] == EMPTY);
             let hidx = Self::hist_idx(pos, m);
-            if !self.try_move(pos, m, !in_check, pinned) {
+            if !self.try_move(pos, m, !in_check, pinned, evasion) {
                 continue;
             }
             legal += 1;
@@ -523,6 +533,11 @@ impl Searcher {
         let mut moves = std::mem::take(&mut self.move_bufs[ply]);
         moves.clear();
         pos.pseudo_moves(&mut moves, !in_check);
+        let evasion = if really_in_check { pos.evasion_mask() } else { 0 };
+        if really_in_check {
+            let ksq = pos.king_sq[pos.side];
+            moves.retain(|&m| evasion >> mv_to(m) & 1 != 0 || (!mv_is_drop(m) && mv_from(m) == ksq));
+        }
         if !in_check {
             // 安い駒を高い駒で取り、取り返される手は読まない（簡易 SEE）。並べ替えの前に除く
             moves.retain(|&m| {
@@ -533,7 +548,7 @@ impl Searcher {
         }
         self.order_moves(pos, &mut moves, NO_MOVE, MAX_PLY, !in_check);
         let mut legal = 0;
-        let pinned = if really_in_check { 0 } else { pos.pinned_mask() };
+        let pinned = pos.pinned_mask();
         for &m in moves.iter() {
             if !in_check && !mv_is_drop(m) {
                 let victim = PIECE_VALUE[ptype(pos.board[mv_to(m)]) as usize];
@@ -542,7 +557,7 @@ impl Searcher {
                     continue;
                 }
             }
-            if !self.try_move(pos, m, !really_in_check, pinned) {
+            if !self.try_move(pos, m, !really_in_check, pinned, evasion) {
                 continue;
             }
             legal += 1;
@@ -583,5 +598,52 @@ mod tests {
         let r = s.search(&mut pos, &Limits { time_ms: None, depth: Some(5), nodes: None });
         assert_ne!(move_to_usi(r.best), "P*1b");
         assert!(r.score < MATE - 1000);
+    }
+
+    #[test]
+    fn evasion_filter_matches_legal_moves() {
+        // ランダムに指し進め、王手された局面で「evasion_mask で絞って try_move」が合法手と一致するか
+        let mut s = Searcher::new(1);
+        let mut rng = 0x1234_5678_9abc_def1u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut checked = 0;
+        for _ in 0..3000 {
+            let mut pos = Position::startpos();
+            for _ in 0..200 {
+                let mut legal = pos.legal_moves();
+                if legal.is_empty() {
+                    break;
+                }
+                let in_check = pos.in_check();
+                let mut moves = Vec::new();
+                pos.pseudo_moves(&mut moves, false);
+                let evasion = if in_check { pos.evasion_mask() } else { 0 };
+                if in_check {
+                    let ksq = pos.king_sq[pos.side];
+                    moves.retain(|&m| evasion >> mv_to(m) & 1 != 0 || (!mv_is_drop(m) && mv_from(m) == ksq));
+                    checked += 1;
+                }
+                let pinned = pos.pinned_mask();
+                let mut got = Vec::new();
+                for &m in moves.iter() {
+                    if s.try_move(&mut pos, m, !in_check, pinned, evasion) {
+                        pos.undo_move();
+                        got.push(m);
+                    }
+                }
+                legal.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(legal, got, "{}", pos.to_sfen());
+                let m = legal[(next() % legal.len() as u64) as usize];
+                pos.do_move(m);
+            }
+        }
+        eprintln!("checked {}", checked);
+        assert!(checked > 1000, "checked {}", checked);
     }
 }
