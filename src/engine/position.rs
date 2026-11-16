@@ -328,7 +328,6 @@ struct Undo {
     eval_dirty: bool,
     moved: u8, // 動かした（打った）駒（成る前）
     hand_n: u8, // 打った・取った駒種の指す前の持ち駒の枚数
-    check: i8,  // 指す前の局面の in_check のメモ
 }
 
 #[derive(Clone)]
@@ -348,10 +347,6 @@ pub struct Position {
     // do_move では更新せず、評価するときに直近の有効な局面から差分で追いつく（遅延更新）。
     nn_acc: Vec<super::eval::NnAcc>,
     nn_ok: Vec<bool>,
-    /// 玉移動後の隠れ層の作り直しに使う、玉の位置の組ごとの記録（eval::compute_nn_cached）
-    nn_cache: Vec<super::eval::NnCacheEntry>,
-    /// in_check() のメモ（-1 = 未計算, 0 / 1）。do_move/undo_move で切り替える
-    check: std::cell::Cell<i8>,
     history: Vec<Undo>,
 }
 
@@ -385,8 +380,6 @@ impl Position {
             eval_dirty: false,
             nn_acc: Vec::with_capacity(512),
             nn_ok: Vec::with_capacity(512),
-            nn_cache: Vec::new(),
-            check: std::cell::Cell::new(-1),
             history: Vec::with_capacity(512),
         };
         let (mut r, mut c) = (0usize, 0usize);
@@ -630,7 +623,7 @@ impl Position {
         self.hash ^= z.side;
         self.side ^= 1;
         self.ply += 1;
-        self.history.push(Undo { mv: m, captured, hash: prev_hash, eval: prev_eval, eval_dirty: prev_dirty, moved, hand_n, check: self.check.replace(-1) });
+        self.history.push(Undo { mv: m, captured, hash: prev_hash, eval: prev_eval, eval_dirty: prev_dirty, moved, hand_n });
         self.push_nn_slot();
     }
 
@@ -661,12 +654,7 @@ impl Position {
                 j -= 1;
             }
             if refresh {
-                let mut cache = std::mem::take(&mut self.nn_cache);
-                if cache.is_empty() {
-                    cache = super::eval::new_nn_cache();
-                }
-                self.nn_acc[cur] = super::eval::compute_nn_cached(self, &mut cache);
-                self.nn_cache = cache;
+                self.nn_acc[cur] = super::eval::compute_nn(self);
             } else {
                 // 玉は j..cur の間動いていないので現在の玉位置で差分を計算できる
                 let ksq = self.king_sq;
@@ -731,7 +719,6 @@ impl Position {
         self.hash = u.hash;
         self.eval = u.eval;
         self.eval_dirty = u.eval_dirty;
-        self.check.set(u.check);
     }
 
     /// 玉が動いた後で、線形評価の全計算が済んでいない
@@ -755,7 +742,7 @@ impl Position {
         self.hash ^= zobrist().side;
         self.side ^= 1;
         self.ply += 1;
-        self.history.push(Undo { mv: NO_MOVE, captured: EMPTY, hash: prev, eval: self.eval, eval_dirty: self.eval_dirty, moved: EMPTY, hand_n: 0, check: self.check.replace(-1) });
+        self.history.push(Undo { mv: NO_MOVE, captured: EMPTY, hash: prev, eval: self.eval, eval_dirty: self.eval_dirty, moved: EMPTY, hand_n: 0 });
         self.push_nn_slot();
     }
 
@@ -764,7 +751,6 @@ impl Position {
         self.side ^= 1;
         self.ply -= 1;
         self.hash = u.hash;
-        self.check.set(u.check);
     }
 
     /// 直近 n 手前の局面ハッシュ（1 = 直前の局面）
@@ -910,13 +896,7 @@ impl Position {
 
     #[inline]
     pub fn in_check(&self) -> bool {
-        let c = self.check.get();
-        if c >= 0 {
-            return c != 0;
-        }
-        let r = self.is_attacked(self.king_sq[self.side], self.side ^ 1);
-        self.check.set(r as i8);
-        r
+        self.is_attacked(self.king_sq[self.side], self.side ^ 1)
     }
 
     // ---- 指し手生成 ----

@@ -337,7 +337,7 @@ impl<const N: usize> NnDelta<N> {
         NnDelta { rows: [[const { MaybeUninit::uninit() }; N]; 2], n: [0, 0] }
     }
     #[inline(always)]
-    pub(crate) fn push(&mut self, c: Color, row: usize, k: i32) {
+    fn push(&mut self, c: Color, row: usize, k: i32) {
         self.rows[c][self.n[c]] = MaybeUninit::new((row as u32, k));
         self.n[c] += 1;
     }
@@ -401,79 +401,6 @@ pub fn compute_nn(pos: &Position) -> NnAcc {
     let mut d = NnDelta::<320>::new();
     eval_terms(pos, |c, idx, k| d.term(c, idx, k));
     d.apply(&mut acc);
-    acc
-}
-
-/// 玉の位置の組ごとに、最後に全計算（または差分で再計算）した局面の盤面・持ち駒と隠れ層を覚えておく表。
-/// 玉が動いて隠れ層を作り直すとき、同じ玉の位置の組の記録からの差分（変わった升と持ち駒）だけを足す。
-/// 整数の加減算なので結果は全計算と完全に一致する。
-#[derive(Clone, Copy)]
-pub struct NnCacheEntry {
-    key: u16, // 先手玉 * 81 + 後手玉 + 1（0 = 空）
-    board: [u8; 81],
-    hand: [[u8; 8]; 2],
-    acc: NnAcc,
-}
-
-pub const NN_CACHE_SIZE: usize = 2048;
-
-/// 差分の升がこれより多ければ全計算する
-const NN_CACHE_MAX_DIFF: usize = 32;
-
-pub fn new_nn_cache() -> Vec<NnCacheEntry> {
-    vec![NnCacheEntry { key: 0, board: [EMPTY; 81], hand: [[0; 8]; 2], acc: [[0; NN_H]; 2] }; NN_CACHE_SIZE]
-}
-
-/// compute_nn と同じ値を、玉の位置の組の記録からの差分で求める
-pub fn compute_nn_cached(pos: &Position, cache: &mut [NnCacheEntry]) -> NnAcc {
-    let ks = pos.king_sq;
-    if ks[0] >= 81 || ks[1] >= 81 || !nn().enabled || cache.is_empty() {
-        return compute_nn(pos);
-    }
-    let key = (ks[0] * 81 + ks[1] + 1) as u16;
-    let idx = ((key as u32).wrapping_mul(0x9E37_79B1) >> 16) as usize & (NN_CACHE_SIZE - 1);
-    let e = &mut cache[idx];
-    if e.key == key {
-        let mut ndiff = 0;
-        for sq in 0..81 {
-            ndiff += (e.board[sq] != pos.board[sq]) as usize;
-        }
-        if ndiff <= NN_CACHE_MAX_DIFF {
-            let mut d = NnDelta::<512>::new();
-            for sq in 0..81 {
-                let (old, new) = (e.board[sq], pos.board[sq]);
-                if old != new {
-                    if old != EMPTY {
-                        d.piece(sq, old, &ks, -1);
-                    }
-                    if new != EMPTY {
-                        d.piece(sq, new, &ks, 1);
-                    }
-                }
-            }
-            for c in 0..2 {
-                for pt in 1..8 {
-                    let (a, b) = (e.hand[c][pt] as usize, pos.hand[c][pt] as usize);
-                    if a == b {
-                        continue;
-                    }
-                    d.push(c, NN_HAND + pt, b as i32 - a as i32);
-                    d.push(c ^ 1, NN_BASE + NN_HAND + pt, b as i32 - a as i32);
-                    let (lo, hi, k) = if b > a { (a + 1, b, 1) } else { (b + 1, a, -1) };
-                    for n in lo..=hi {
-                        d.push(c, NN_HANDK + pt * HANDK_W + n, k);
-                        d.push(c ^ 1, NN_BASE + NN_HANDK + pt * HANDK_W + n, k);
-                    }
-                }
-            }
-            d.apply(&mut e.acc);
-            e.board = pos.board;
-            e.hand = pos.hand;
-            return e.acc;
-        }
-    }
-    let acc = compute_nn(pos);
-    *e = NnCacheEntry { key, board: pos.board, hand: pos.hand, acc };
     acc
 }
 
