@@ -270,5 +270,13 @@
     "parent": "v33-nadeshiko",
     "created": "2026-11-15T01:26:19Z",
     "description": "高速化: 王手中は王手駒の取り・合駒・玉移動以外の手を並べ替え前に除き、pin されていない駒の手は自殺手判定を省く（命令数/ノード約 -21%、4 本同時 NPS 約 +27%）"
+  },
+  {
+    "number": 35,
+    "name": "seiran",
+    "commit": "eda023356dbafde61605b983a47a7cc61709aa06",
+    "parent": "v34-otowa",
+    "created": "2026-11-17T01:27:53Z",
+    "description": "高速化: 指し手の段階生成（置換表の手→良い取り→静かな手と損な取り）、王手中は回避手だけ生成、玉移動後の NN 隠れ層を Finny table から差分、in_check メモ（並べ替え順は v34 と同じ、4 本同時 NPS 約 +27%）"
   }
 ]
