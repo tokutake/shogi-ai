@@ -183,6 +183,11 @@ pub struct Tables {
     pub step_bb: [[[u128; 81]; 16]; 2],
 }
 
+const GEN_ALL: u8 = 0;
+const GEN_CAPTURES: u8 = 1;
+const GEN_QUIETS: u8 = 2;
+const GEN_EVASIONS: u8 = 3;
+
 /// 盤上 81 升の集合
 pub const BOARD_BB: u128 = (1u128 << 81) - 1;
 
@@ -955,17 +960,43 @@ impl Position {
     /// 疑似合法手（自玉への王手放置チェック・打ち歩詰めチェックなし）
     /// captures_only = true なら駒を取る手（と成る手）のみ
     pub fn pseudo_moves(&self, list: &mut Vec<Move>, captures_only: bool) {
+        self.gen_moves(list, if captures_only { GEN_CAPTURES } else { GEN_ALL }, 0);
+    }
+
+    /// 駒を取らない手（取らない成りと打つ手を含む）。pseudo_moves(list, true) と合わせると全疑似合法手
+    pub fn pseudo_moves_quiet(&self, list: &mut Vec<Move>) {
+        self.gen_moves(list, GEN_QUIETS, 0);
+    }
+
+    /// 王手中の疑似合法手のうち、玉の手と、玉以外で evasion（evasion_mask()）の升へ動く・打つ手。
+    /// pseudo_moves(list, false) から同じ条件で retain したものと同じ並び
+    pub fn pseudo_evasions(&self, list: &mut Vec<Move>, evasion: u128) {
+        self.gen_moves(list, GEN_EVASIONS, evasion);
+    }
+
+    #[inline(always)]
+    fn gen_moves(&self, list: &mut Vec<Move>, mode: u8, evasion: u128) {
+        let captures_only = mode == GEN_CAPTURES;
+        let quiets_only = mode == GEN_QUIETS;
         let us = self.side;
         let t = tables();
         let occ = self.occ[0] | self.occ[1];
         let not_own = !self.occ[us];
-        let target_mask = if captures_only { self.occ[us ^ 1] } else { not_own & BOARD_BB };
+        let target_mask = if captures_only {
+            self.occ[us ^ 1]
+        } else if quiets_only {
+            !occ & BOARD_BB
+        } else {
+            not_own & BOARD_BB
+        };
         let mut own = self.occ[us];
         while own != 0 {
             let from = own.trailing_zeros() as usize;
             own &= own - 1;
             let pt = ptype(self.board[from]);
             let fr = (from / 9) as i32;
+            // 王手中の玉以外の駒は evasion の升にしか動けない
+            let allow = if mode == GEN_EVASIONS && pt != KING { evasion } else { BOARD_BB };
             let lmask = t.slide_mask[us][pt as usize];
             if lmask == 0 {
                 // 1歩の駒・桂（行き先は升番号の昇順 = 方向順）
@@ -973,7 +1004,9 @@ impl Position {
                 while b != 0 {
                     let to = b.trailing_zeros() as usize;
                     b &= b - 1;
-                    self.push_board_move(list, from, to, pt, fr, (to / 9) as i32);
+                    if mode != GEN_EVASIONS || allow >> to & 1 != 0 {
+                        self.push_board_move(list, from, to, pt, fr, (to / 9) as i32);
+                    }
                 }
                 continue;
             }
@@ -990,7 +1023,9 @@ impl Position {
                         let n = if slide { t.ray_len[from][d] as usize } else { (t.ray_len[from][d] as usize).min(1) };
                         for i in 0..n {
                             let to = t.ray[from][d][i] as usize;
-                            self.push_board_move(list, from, to, pt, fr, (to / 9) as i32);
+                            if mode != GEN_EVASIONS || allow >> to & 1 != 0 {
+                                self.push_board_move(list, from, to, pt, fr, (to / 9) as i32);
+                            }
                         }
                     }
                     continue;
@@ -1001,18 +1036,24 @@ impl Position {
                 let dist = if dir_positive(d) { (blk - from) / (step - from) } else { (from - blk) / (from - step) };
                 if !slide && dist > 1 {
                     if !captures_only {
-                        self.push_board_move(list, from, step, pt, fr, (step / 9) as i32);
+                        if mode != GEN_EVASIONS || allow >> step & 1 != 0 {
+                            self.push_board_move(list, from, step, pt, fr, (step / 9) as i32);
+                        }
                     }
                     continue;
                 }
                 if !captures_only {
                     for i in 0..dist - 1 {
                         let to = t.ray[from][d][i] as usize;
-                        self.push_board_move(list, from, to, pt, fr, (to / 9) as i32);
+                        if mode != GEN_EVASIONS || allow >> to & 1 != 0 {
+                            self.push_board_move(list, from, to, pt, fr, (to / 9) as i32);
+                        }
                     }
                 }
-                if self.occ[us ^ 1] >> blk & 1 != 0 {
-                    self.push_board_move(list, from, blk, pt, fr, (blk / 9) as i32);
+                if !quiets_only && self.occ[us ^ 1] >> blk & 1 != 0 {
+                    if mode != GEN_EVASIONS || allow >> blk & 1 != 0 {
+                        self.push_board_move(list, from, blk, pt, fr, (blk / 9) as i32);
+                    }
                 }
             }
         }
@@ -1024,7 +1065,7 @@ impl Position {
         if hand.iter().all(|&n| n == 0) {
             return;
         }
-        let empties = BOARD_BB & !occ;
+        let empties = if mode == GEN_EVASIONS { evasion & !occ } else { BOARD_BB & !occ };
         let mut pawn_file_bb = 0u128;
         if hand[PAWN as usize] > 0 {
             let own_pawn = make_piece(us, PAWN);
@@ -1059,6 +1100,76 @@ impl Position {
                 b &= b - 1;
                 list.push(mv_drop(pt, to));
             }
+        }
+    }
+
+    /// m が pseudo_moves(list, false) の生成する手に含まれるか（置換表の手を生成前に試すための確認）
+    pub fn is_pseudo_legal(&self, m: Move) -> bool {
+        if m == NO_MOVE {
+            return false;
+        }
+        let us = self.side;
+        let to = mv_to(m);
+        if to >= 81 {
+            return false;
+        }
+        let tr = (to / 9) as i32;
+        if mv_is_drop(m) {
+            let pt = mv_drop_pt(m);
+            if mv_is_promo(m) || !(PAWN..=ROOK).contains(&pt) || self.hand[us][pt as usize] == 0 || self.board[to] != EMPTY {
+                return false;
+            }
+            if Self::dead_end(us, pt, tr) {
+                return false;
+            }
+            if pt == PAWN {
+                let own_pawn = make_piece(us, PAWN);
+                let file = FILE_BB[to % 9] & self.occ[us];
+                let mut b = file;
+                while b != 0 {
+                    let sq = b.trailing_zeros() as usize;
+                    b &= b - 1;
+                    if self.board[sq] == own_pawn {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        let from = mv_from(m);
+        if from >= 81 || self.occ[us] >> from & 1 == 0 || self.occ[us] >> to & 1 != 0 {
+            return false;
+        }
+        let pt = ptype(self.board[from]);
+        let t = tables();
+        let mut reach = t.step_bb[us][pt as usize][from] >> to & 1 != 0;
+        if !reach {
+            let lmask = t.slide_mask[us][pt as usize];
+            let occ = self.occ[0] | self.occ[1];
+            for d in 0..8 {
+                if lmask & (1 << d) == 0 || t.ray_mask[from][d] >> to & 1 == 0 {
+                    continue;
+                }
+                let blockers = t.ray_mask[from][d] & occ;
+                if blockers == 0 {
+                    reach = true;
+                } else {
+                    let blk = first_blocker(blockers, d);
+                    // to が最初の駒の升かそれより手前
+                    reach = if dir_positive(d) { to <= blk } else { to >= blk };
+                }
+                break;
+            }
+        }
+        if !reach {
+            return false;
+        }
+        let fr = (from / 9) as i32;
+        let can_promo = can_promote_type(pt) && (Self::in_promo_zone(us, fr) || Self::in_promo_zone(us, tr));
+        if mv_is_promo(m) {
+            can_promo
+        } else {
+            !(can_promo && Self::dead_end(us, pt, tr))
         }
     }
 
@@ -1178,4 +1289,48 @@ mod tests {
             assert!(!sfen.is_empty());
         }
     }
+    /// is_pseudo_legal が pseudo_moves の生成結果と一致すること（他局面の手・乱数の手も含めて）
+    #[test]
+    fn pseudo_legal_matches_generation() {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut prev: Vec<Move> = Vec::new();
+        let mut checked = 0;
+        for _ in 0..200 {
+            let mut pos = Position::startpos();
+            for _ in 0..150 {
+                let mut gen = Vec::new();
+                pos.pseudo_moves(&mut gen, false);
+                let mut split = Vec::new();
+                pos.pseudo_moves(&mut split, true);
+                pos.pseudo_moves_quiet(&mut split);
+                let mut a = gen.clone();
+                a.sort_unstable();
+                split.sort_unstable();
+                assert_eq!(a, split, "{}", pos.to_sfen());
+                let mut cands = gen.clone();
+                cands.extend(prev.iter().copied());
+                for _ in 0..50 {
+                    cands.push((next() & 0xffff) as Move);
+                }
+                for &m in cands.iter() {
+                    assert_eq!(pos.is_pseudo_legal(m), gen.contains(&m), "{} {}", pos.to_sfen(), m);
+                    checked += 1;
+                }
+                prev = gen;
+                let legal = pos.legal_moves();
+                if legal.is_empty() {
+                    break;
+                }
+                pos.do_move(legal[(next() % legal.len() as u64) as usize]);
+            }
+        }
+        assert!(checked > 100000);
+    }
 }
+

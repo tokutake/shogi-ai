@@ -83,6 +83,7 @@ pub struct Searcher {
     scratch: Vec<(i32, Move)>,
     move_bufs: Vec<Vec<Move>>,
     quiet_bufs: Vec<Vec<Move>>,
+    bad_bufs: Vec<Vec<Move>>,
 }
 
 #[inline]
@@ -123,6 +124,7 @@ impl Searcher {
             scratch: Vec::with_capacity(256),
             move_bufs: vec![Vec::with_capacity(160); MAX_PLY + 2],
             quiet_bufs: vec![Vec::with_capacity(64); MAX_PLY + 2],
+            bad_bufs: vec![Vec::with_capacity(16); MAX_PLY + 2],
         }
     }
 
@@ -388,14 +390,24 @@ impl Searcher {
 
         let mut moves = std::mem::take(&mut self.move_bufs[ply]);
         moves.clear();
-        pos.pseudo_moves(&mut moves, false);
         let evasion = if in_check { pos.evasion_mask() } else { 0 };
+        // 指し手は段階的に生成する（王手中以外）: 0 = 置換表の手、1 = 良い取り、2 = 静かな手と損な取り。
+        // 並べ替えの順序は一括生成と同じで、置換表の手や良い取りでカットできれば静かな手（駒打ち）を生成しない
+        let mut stage;
         if in_check {
-            // 王手を解消しない手（玉以外で王手駒を取らず間にも入らない手）は並べ替えの前に除く
-            let ksq = pos.king_sq[pos.side];
-            moves.retain(|&m| evasion >> mv_to(m) & 1 != 0 || (!mv_is_drop(m) && mv_from(m) == ksq));
+            // 王手を解消しない手（玉以外で王手駒を取らず間にも入らない手）は生成しない
+            pos.pseudo_evasions(&mut moves, evasion);
+            self.order_moves(pos, &mut moves, tt_move, ply, false);
+            stage = 3;
+        } else {
+            if pos.is_pseudo_legal(tt_move) {
+                moves.push(tt_move);
+            }
+            stage = 1;
         }
-        self.order_moves(pos, &mut moves, tt_move, ply, false);
+        let mut bad_captures = std::mem::take(&mut self.bad_bufs[ply]);
+        bad_captures.clear();
+        let mut idx = 0;
 
         let orig_alpha = alpha;
         let mut best_score = -INF;
@@ -404,7 +416,39 @@ impl Searcher {
         let pinned = pos.pinned_mask();
         let mut quiets_tried = std::mem::take(&mut self.quiet_bufs[ply]);
         quiets_tried.clear();
-        for &m in moves.iter() {
+        loop {
+            if idx >= moves.len() {
+                match stage {
+                    1 => {
+                        moves.clear();
+                        pos.pseudo_moves(&mut moves, true);
+                        if tt_move != NO_MOVE {
+                            moves.retain(|&m| m != tt_move);
+                        }
+                        self.order_moves(pos, &mut moves, NO_MOVE, ply, false);
+                        // 損な取り（静かな手の後ろに回す点数）は次の段階へ
+                        let n_good = self.scratch.iter().take_while(|&&(sc, _)| sc >= 100_000).count();
+                        bad_captures.extend_from_slice(&moves[n_good..]);
+                        moves.truncate(n_good);
+                        stage = 2;
+                    }
+                    2 => {
+                        moves.clear();
+                        pos.pseudo_moves_quiet(&mut moves);
+                        if tt_move != NO_MOVE {
+                            moves.retain(|&m| m != tt_move);
+                        }
+                        moves.extend_from_slice(&bad_captures);
+                        self.order_moves(pos, &mut moves, NO_MOVE, ply, false);
+                        stage = 3;
+                    }
+                    _ => break,
+                }
+                idx = 0;
+                continue;
+            }
+            let m = moves[idx];
+            idx += 1;
             let quiet = !mv_is_promo(m) && (mv_is_drop(m) || pos.board[mv_to(m)] == EMPTY);
             let hidx = Self::hist_idx(pos, m);
             if !self.try_move(pos, m, !in_check, pinned, evasion) {
@@ -461,6 +505,7 @@ impl Searcher {
             if self.stopped {
                 self.move_bufs[ply] = moves;
                 self.quiet_bufs[ply] = quiets_tried;
+                self.bad_bufs[ply] = bad_captures;
                 return 0;
             }
             if score > best_score {
@@ -493,6 +538,7 @@ impl Searcher {
         }
         self.move_bufs[ply] = moves;
         self.quiet_bufs[ply] = quiets_tried;
+        self.bad_bufs[ply] = bad_captures;
         if legal == 0 {
             // 詰み（将棋では手がない＝負け）
             return -MATE + ply as i32;
@@ -532,11 +578,15 @@ impl Searcher {
         }
         let mut moves = std::mem::take(&mut self.move_bufs[ply]);
         moves.clear();
-        pos.pseudo_moves(&mut moves, !in_check);
         let evasion = if really_in_check { pos.evasion_mask() } else { 0 };
-        if really_in_check {
-            let ksq = pos.king_sq[pos.side];
-            moves.retain(|&m| evasion >> mv_to(m) & 1 != 0 || (!mv_is_drop(m) && mv_from(m) == ksq));
+        if in_check {
+            pos.pseudo_evasions(&mut moves, evasion);
+        } else {
+            pos.pseudo_moves(&mut moves, true);
+            if really_in_check {
+                let ksq = pos.king_sq[pos.side];
+                moves.retain(|&m| evasion >> mv_to(m) & 1 != 0 || (!mv_is_drop(m) && mv_from(m) == ksq));
+            }
         }
         if !in_check {
             // 安い駒を高い駒で取り、取り返される手は読まない（簡易 SEE）。並べ替えの前に除く
@@ -626,6 +676,9 @@ mod tests {
                 if in_check {
                     let ksq = pos.king_sq[pos.side];
                     moves.retain(|&m| evasion >> mv_to(m) & 1 != 0 || (!mv_is_drop(m) && mv_from(m) == ksq));
+                    let mut ev = Vec::new();
+                    pos.pseudo_evasions(&mut ev, evasion);
+                    assert_eq!(moves, ev, "{}", pos.to_sfen());
                     checked += 1;
                 }
                 let pinned = pos.pinned_mask();
