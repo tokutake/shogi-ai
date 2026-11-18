@@ -121,6 +121,8 @@ struct LinTables {
     opp: [[i32; 289]; 15],
     /// [升][玉の升] → 先手視点の相対位置の番号（後手は 288 - これ）
     rel: [[u16; 81]; 81],
+    /// [駒種][枚数 n] = 持ち駒 1〜n 枚目の hand_score の和
+    hand_cum: [[i32; HANDK_W]; 8],
 }
 
 fn lin_tables() -> &'static LinTables {
@@ -129,7 +131,7 @@ fn lin_tables() -> &'static LinTables {
         // const の P を直接添字で引くと毎回スタックへ複製されるので、static への参照で引く
         static PS: [i32; NUM_PARAMS] = P;
         let pp = &PS;
-        let mut t = LinTables { pst: [[0; 81]; 32], own: [[0; 289]; 15], opp: [[0; 289]; 15], rel: [[0; 81]; 81] };
+        let mut t = LinTables { pst: [[0; 81]; 32], own: [[0; 289]; 15], opp: [[0; 289]; 15], rel: [[0; 81]; 81], hand_cum: [[0; HANDK_W]; 8] };
         for sq in 0..81 {
             for k in 0..81 {
                 let dr = (sq / 9) as i32 - (k / 9) as i32;
@@ -172,6 +174,11 @@ fn lin_tables() -> &'static LinTables {
                 t.opp[pt as usize][rel] = pp[IDX_KP_OPP + pt as usize * 289 + rel] + atk;
             }
         }
+        for pt in 1..8 {
+            for n in 1..HANDK_W {
+                t.hand_cum[pt][n] = t.hand_cum[pt][n - 1] + hand_score(pt, n);
+            }
+        }
         t
     })
 }
@@ -180,24 +187,25 @@ fn lin_tables() -> &'static LinTables {
 /// 手番ボーナスを含まない各色の評価合計
 pub fn compute_scores(pos: &Position) -> [i32; 2] {
     let mut score = [0i32; 2];
-    for sq in 0..81 {
-        let p = pos.board[sq];
-        if p != EMPTY {
-            score[color_of(p)] += piece_score(sq, p, &pos.king_sq);
+    for c in 0..2 {
+        let mut b = pos.occ[c];
+        while b != 0 {
+            let sq = b.trailing_zeros() as usize;
+            b &= b - 1;
+            score[c] += piece_score(sq, pos.board[sq], &pos.king_sq);
         }
     }
+    let t = lin_tables();
     for c in 0..2 {
         for pt in 1..8 {
-            for k in 1..=pos.hand[c][pt] as usize {
-                score[c] += hand_score(pt, k);
-            }
+            score[c] += t.hand_cum[pt][pos.hand[c][pt] as usize];
         }
     }
     score
 }
 
 /// 駒 1 枚分の評価（その駒の色の側に加算される値）。piece_terms の和と同じ
-#[inline]
+#[inline(always)]
 pub fn piece_score(sq: usize, p: u8, ksq: &[usize; 2]) -> i32 {
     let t = lin_tables();
     let v = t.pst[p as usize][sq];
@@ -287,6 +295,9 @@ pub struct Nn {
     pub w1: Vec<NnRow>,
     pub b1: [i16; NN_H],
     pub v: [[f32; NN_H]; 2], // [手番側, 相手側]。量子化した隠れ層に掛けるため 1/NN_Q 済み
+    /// 出力層の重みを i16 に量子化したもの（v * NN_Q * vq_scale）。出力は積和 * vq_inv
+    pub vq: [[i16; NN_H]; 2],
+    pub vq_inv: f32,
 }
 
 #[inline(always)]
@@ -299,7 +310,7 @@ pub fn nn() -> &'static Nn {
     N.get_or_init(|| {
         let bytes: &[u8] = include_bytes!("nn.bin");
         let total = NN_IN * NN_H + NN_H + 2 * NN_H;
-        let mut nn = Nn { enabled: false, w1: Vec::new(), b1: [0; NN_H], v: [[0.0; NN_H]; 2] };
+        let mut nn = Nn { enabled: false, w1: Vec::new(), b1: [0; NN_H], v: [[0.0; NN_H]; 2], vq: [[0; NN_H]; 2], vq_inv: 0.0 };
         if bytes.len() != total * 4 {
             return nn;
         }
@@ -318,6 +329,19 @@ pub fn nn() -> &'static Nn {
             nn.v[0][j] = f[o + NN_H + j] / NN_Q;
             nn.v[1][j] = f[o + 2 * NN_H + j] / NN_Q;
         }
+        // 倍率は 2 の冪で、各重みが i16 に収まり、積和（隠れ層は 0..NN_Q）が i32 に収まる最大（上限 2^10）
+        let vmax = nn.v.iter().flatten().fold(0.0f32, |m, &x| m.max((x * NN_Q).abs()));
+        let vsum: f32 = nn.v.iter().flatten().map(|&x| (x * NN_Q).abs()).sum();
+        let mut scale = 1024.0f32;
+        while scale > 1.0 && (vmax * scale > 32000.0 || vsum * scale * NN_Q > 2.0e9) {
+            scale /= 2.0;
+        }
+        for c in 0..2 {
+            for j in 0..NN_H {
+                nn.vq[c][j] = (nn.v[c][j] * NN_Q * scale).round() as i16;
+            }
+        }
+        nn.vq_inv = 1.0 / (NN_Q * scale);
         nn.enabled = true;
         nn
     })
@@ -352,7 +376,25 @@ impl<const N: usize> NnDelta<N> {
     /// 盤上の駒 1 枚の寄与を加減算する（sign = +1 / -1）
     #[inline(always)]
     pub fn piece(&mut self, sq: usize, p: u8, ksq: &[usize; 2], sign: i32) {
-        piece_terms(sq, p, ksq, &mut |c, idx, k| self.term(c, idx, sign * k));
+        // piece_terms のうち NN の入力になる PST・KP_OWN・KP_OPP の 3 つだけを表引きで求める（nn_index 経由と同じ番号）
+        let pt = ptype(p) as usize;
+        let c = color_of(p);
+        let rsq = if c == BLACK { sq } else { 80 - sq };
+        let i0 = pt * 81 + rsq;
+        self.push(c, i0, sign);
+        self.push(c ^ 1, NN_BASE + i0, sign);
+        if pt == KING as usize {
+            return;
+        }
+        let t = lin_tables();
+        let (ro, re) = (t.rel[sq][ksq[c]] as usize, t.rel[sq][ksq[c ^ 1]] as usize);
+        let (ro, re) = if c == BLACK { (ro, re) } else { (288 - ro, 288 - re) };
+        let i1 = (IDX_KP_OWN - IDX_PST) + pt * 289 + ro;
+        let i2 = (IDX_KP_OPP - IDX_PST) + pt * 289 + re;
+        self.push(c, i1, sign);
+        self.push(c ^ 1, NN_BASE + i1, sign);
+        self.push(c, i2, sign);
+        self.push(c ^ 1, NN_BASE + i2, sign);
     }
     /// 持ち駒 pt の k 枚目を加える（delta = +1）/ 除く（delta = -1）
     #[inline(always)]
@@ -481,11 +523,13 @@ pub fn compute_nn_cached(pos: &Position, cache: &mut [NnCacheEntry]) -> NnAcc {
 pub fn nn_output(acc: &NnAcc, us: usize) -> f32 {
     let n = nn();
     let q = NN_Q as i16;
-    let mut s = 0.0f32;
+    // 出力層も i16 x i16 → i32 の積和で計算する（SIMD の pmaddwd になる）
+    let (a, b) = (&acc[us], &acc[us ^ 1]);
+    let mut s = 0i32;
     for i in 0..NN_H {
-        s += n.v[0][i] * acc[us][i].clamp(0, q) as f32 + n.v[1][i] * acc[us ^ 1][i].clamp(0, q) as f32;
+        s += n.vq[0][i] as i32 * a[i].clamp(0, q) as i32 + n.vq[1][i] as i32 * b[i].clamp(0, q) as i32;
     }
-    s
+    s as f32 * n.vq_inv
 }
 
 #[cfg(test)]

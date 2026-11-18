@@ -271,9 +271,9 @@ impl Searcher {
     }
 
     /// 疑似合法手を指して、合法なら true（不合法なら戻して false）
-    /// safe = 王手されていない。王手されているときは evasion = pos.evasion_mask()、pinned も計算済みであること
+    /// safe = 王手されていない。王手されているときは evasion = pos.evasion_mask() であること
     #[inline]
-    fn try_move(&mut self, pos: &mut Position, m: Move, safe: bool, pinned: u128, evasion: u128) -> bool {
+    fn try_move(&mut self, pos: &mut Position, m: Move, safe: bool, evasion: u128) -> bool {
         let is_pawn_drop = mv_is_drop(m) && mv_drop_pt(m) == PAWN;
         let is_king = !mv_is_drop(m) && ptype(pos.board[mv_from(m)]) == KING;
         if !safe && !is_king {
@@ -284,7 +284,7 @@ impl Searcher {
         }
         // 玉でも pin された駒でもない手は必ず合法（王手中は上の条件を満たすもの。歩打ちは打ち歩詰めのため別扱い）
         if !is_pawn_drop && !is_king {
-            if mv_is_drop(m) || pinned >> mv_from(m) & 1 == 0 {
+            if mv_is_drop(m) || !pos.is_pinned(mv_from(m)) {
                 pos.do_move(m);
                 return true;
             }
@@ -413,7 +413,6 @@ impl Searcher {
         let mut best_score = -INF;
         let mut best_move = NO_MOVE;
         let mut legal = 0;
-        let pinned = pos.pinned_mask();
         let mut quiets_tried = std::mem::take(&mut self.quiet_bufs[ply]);
         quiets_tried.clear();
         loop {
@@ -451,7 +450,7 @@ impl Searcher {
             idx += 1;
             let quiet = !mv_is_promo(m) && (mv_is_drop(m) || pos.board[mv_to(m)] == EMPTY);
             let hidx = Self::hist_idx(pos, m);
-            if !self.try_move(pos, m, !in_check, pinned, evasion) {
+            if !self.try_move(pos, m, !in_check, evasion) {
                 continue;
             }
             legal += 1;
@@ -598,7 +597,6 @@ impl Searcher {
         }
         self.order_moves(pos, &mut moves, NO_MOVE, MAX_PLY, !in_check);
         let mut legal = 0;
-        let pinned = pos.pinned_mask();
         for &m in moves.iter() {
             if !in_check && !mv_is_drop(m) {
                 let victim = PIECE_VALUE[ptype(pos.board[mv_to(m)]) as usize];
@@ -607,7 +605,7 @@ impl Searcher {
                     continue;
                 }
             }
-            if !self.try_move(pos, m, !really_in_check, pinned, evasion) {
+            if !self.try_move(pos, m, !really_in_check, evasion) {
                 continue;
             }
             legal += 1;
@@ -681,10 +679,9 @@ mod tests {
                     assert_eq!(moves, ev, "{}", pos.to_sfen());
                     checked += 1;
                 }
-                let pinned = pos.pinned_mask();
-                let mut got = Vec::new();
+                        let mut got = Vec::new();
                 for &m in moves.iter() {
-                    if s.try_move(&mut pos, m, !in_check, pinned, evasion) {
+                    if s.try_move(&mut pos, m, !in_check, evasion) {
                         pos.undo_move();
                         got.push(m);
                     }
