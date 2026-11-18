@@ -181,6 +181,8 @@ pub struct Tables {
     pub ray_mask: [[u128; 8]; 81],
     /// step_bb[color][pt][sq] = 1歩（桂は跳び先）で動ける升の集合。飛び駒の方向は含まない
     pub step_bb: [[[u128; 81]; 16]; 2],
+    /// dir_to[a][b] = a から b への方向（DIRS8 の添字）。同じ直線・斜めにないなら 8
+    pub dir_to: [[u8; 81]; 81],
 }
 
 const GEN_ALL: u8 = 0;
@@ -230,6 +232,7 @@ pub fn tables() -> &'static Tables {
             slide_mask: [[0; 16]; 2],
             ray_mask: [[0; 8]; 81],
             step_bb: [[[0; 81]; 16]; 2],
+            dir_to: [[8; 81]; 81],
         };
         for sq in 0..81 {
             for (d, &(dr, dc)) in DIRS8.iter().enumerate() {
@@ -243,6 +246,9 @@ pub fn tables() -> &'static Tables {
                     c += dc;
                 }
                 t.ray_len[sq][d] = n as u8;
+                for i in 0..n {
+                    t.dir_to[sq][t.ray[sq][d][i] as usize] = d as u8;
+                }
             }
         }
         for color in 0..2 {
@@ -833,6 +839,28 @@ impl Position {
         false
     }
 
+    /// 手番側の from の駒が自玉に対して pin されているか（pinned_mask の 1 升版）
+    #[inline]
+    pub fn is_pinned(&self, from: usize) -> bool {
+        let t = tables();
+        let us = self.side;
+        let ksq = self.king_sq[us];
+        let d = t.dir_to[ksq][from] as usize;
+        if d >= 8 {
+            return false;
+        }
+        let blockers = t.ray_mask[ksq][d] & (self.occ[0] | self.occ[1]);
+        if first_blocker(blockers, d) != from {
+            return false;
+        }
+        let rest = blockers & !(1u128 << from);
+        if rest == 0 {
+            return false;
+        }
+        let p = self.board[first_blocker(rest, d)];
+        color_of(p) != us && t.slide_mask[us ^ 1][ptype(p) as usize] & (1 << (7 - d)) != 0
+    }
+
     /// 自玉に対して pin されている自駒の集合（升ごとのビット）
     pub fn pinned_mask(&self) -> u128 {
         let t = tables();
@@ -919,9 +947,54 @@ impl Position {
         if c >= 0 {
             return c != 0;
         }
-        let r = self.is_attacked(self.king_sq[self.side], self.side ^ 1);
+        let r = match self.history.last() {
+            Some(u) if u.mv != NO_MOVE => self.checked_by_move(u.mv),
+            _ => self.is_attacked(self.king_sq[self.side], self.side ^ 1),
+        };
         self.check.set(r as i8);
         r
+    }
+
+    /// 直前の手 m で手番側の玉に王手がかかったか（動いた駒による直接の王手と開き王手だけを調べる）。
+    /// 手を指す前の局面で手番側の玉に利きがなかった（合法な局面だった）ことが前提。
+    pub fn checked_by_move(&self, m: Move) -> bool {
+        let t = tables();
+        let us = self.side;
+        let them = us ^ 1;
+        let ksq = self.king_sq[us];
+        if ksq >= 81 {
+            return false;
+        }
+        let to = mv_to(m);
+        let pt = ptype(self.board[to]) as usize;
+        let occ = self.occ[0] | self.occ[1];
+        let d = t.dir_to[to][ksq] as usize;
+        if d < 8 {
+            let bit = 1u8 << d;
+            if (t.step_mask[them][pt] | t.slide_mask[them][pt]) & bit != 0 {
+                if t.ray[to][d][0] as usize == ksq {
+                    return true;
+                }
+                if t.slide_mask[them][pt] & bit != 0 && first_blocker(t.ray_mask[to][d] & occ, d) == ksq {
+                    return true;
+                }
+            }
+        } else if pt == KNIGHT as usize && t.step_bb[them][pt][to] >> ksq & 1 != 0 {
+            return true;
+        }
+        if !mv_is_drop(m) {
+            let d = t.dir_to[ksq][mv_from(m)] as usize;
+            if d < 8 {
+                let b = t.ray_mask[ksq][d] & occ;
+                if b != 0 {
+                    let f = first_blocker(b, d);
+                    if self.occ[them] >> f & 1 != 0 && t.slide_mask[them][ptype(self.board[f]) as usize] & (1 << (7 - d)) != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     // ---- 指し手生成 ----
@@ -1253,6 +1326,39 @@ impl Position {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 直前の手からの王手判定（checked_by_move）が全方向の利き判定と一致すること
+    #[test]
+    fn checked_by_move_matches_is_attacked() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut checks = 0;
+        for _ in 0..2000 {
+            let mut pos = Position::startpos();
+            for _ in 0..200 {
+                let legal = pos.legal_moves();
+                if legal.is_empty() {
+                    break;
+                }
+                for &m in legal.iter() {
+                    pos.do_move(m);
+                    let a = pos.checked_by_move(m);
+                    let b = pos.is_attacked(pos.king_sq[pos.side], pos.side ^ 1);
+                    assert_eq!(a, b, "{} {}", pos.to_sfen(), m);
+                    checks += b as usize;
+                    pos.undo_move();
+                }
+                let m = legal[(next() % legal.len() as u64) as usize];
+                pos.do_move(m);
+            }
+        }
+        assert!(checks > 10000, "checks {}", checks);
+    }
 
     /// ランダムな手順で、占有ビットボードが盤面と一致し続けること・指して戻すと元に戻ることを確かめる
     #[test]
