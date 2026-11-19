@@ -449,6 +449,24 @@ impl Searcher {
             let m = moves[idx];
             idx += 1;
             let quiet = !mv_is_promo(m) && (mv_is_drop(m) || pos.board[mv_to(m)] == EMPTY);
+            // 指す前に LMP / futility で読まないと決まる手は do_move しない（必ず合法な手だけ。
+            // 王手になる手は指す前に判定する。下の指した後の枝刈りと同じ条件で、探索木は変わらない）
+            if !pv && !in_check && quiet && best_score > -MATE + 1000 && legal >= 1 {
+                let lmp = depth <= 3 && legal + 1 > (8 + 4 * depth * depth) / (2 - improving as i32);
+                let fut = depth <= 2 && alpha.abs() < MATE - 1000 && static_eval + 120 * depth <= alpha;
+                if (lmp || fut) && !pos.gives_check(m) {
+                    let sure_legal = if mv_is_drop(m) {
+                        true // 王手にならない歩打ちは打ち歩詰めでない
+                    } else {
+                        let from = mv_from(m);
+                        ptype(pos.board[from]) != KING && !pos.is_pinned(from)
+                    };
+                    if sure_legal {
+                        legal += 1;
+                        continue;
+                    }
+                }
+            }
             let hidx = Self::hist_idx(pos, m);
             if !self.try_move(pos, m, !in_check, evasion) {
                 continue;

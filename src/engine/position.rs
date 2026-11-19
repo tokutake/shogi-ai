@@ -997,6 +997,54 @@ impl Position {
         false
     }
 
+    /// 手番側が疑似合法手 m を指すと相手玉に王手がかかるか（指す前の局面で判定する。
+    /// 動いた駒による直接の王手と、from 升が空くことによる開き王手を調べる）
+    pub fn gives_check(&self, m: Move) -> bool {
+        let t = tables();
+        let us = self.side;
+        let ksq = self.king_sq[us ^ 1];
+        if ksq >= 81 {
+            return false;
+        }
+        let to = mv_to(m);
+        let mut occ = (self.occ[0] | self.occ[1]) | (1u128 << to);
+        let pt = if mv_is_drop(m) {
+            mv_drop_pt(m) as usize
+        } else {
+            let from = mv_from(m);
+            occ &= !(1u128 << from);
+            let p = ptype(self.board[from]);
+            (if mv_is_promo(m) { promote(p) } else { p }) as usize
+        };
+        let d = t.dir_to[to][ksq] as usize;
+        if d < 8 {
+            let bit = 1u8 << d;
+            if (t.step_mask[us][pt] | t.slide_mask[us][pt]) & bit != 0 {
+                if t.ray[to][d][0] as usize == ksq {
+                    return true;
+                }
+                if t.slide_mask[us][pt] & bit != 0 && first_blocker(t.ray_mask[to][d] & occ, d) == ksq {
+                    return true;
+                }
+            }
+        } else if pt == KNIGHT as usize && t.step_bb[us][pt][to] >> ksq & 1 != 0 {
+            return true;
+        }
+        if !mv_is_drop(m) {
+            let d = t.dir_to[ksq][mv_from(m)] as usize;
+            if d < 8 {
+                let b = t.ray_mask[ksq][d] & occ;
+                if b != 0 {
+                    let f = first_blocker(b, d);
+                    if f != to && self.occ[us] >> f & 1 != 0 && t.slide_mask[us][ptype(self.board[f]) as usize] & (1 << (7 - d)) != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     // ---- 指し手生成 ----
     #[inline]
     fn in_promo_zone(c: Color, r: i32) -> bool {
@@ -1346,10 +1394,12 @@ mod tests {
                     break;
                 }
                 for &m in legal.iter() {
+                    let g = pos.gives_check(m);
                     pos.do_move(m);
                     let a = pos.checked_by_move(m);
                     let b = pos.is_attacked(pos.king_sq[pos.side], pos.side ^ 1);
                     assert_eq!(a, b, "{} {}", pos.to_sfen(), m);
+                    assert_eq!(g, b, "gives_check {} {}", pos.to_sfen(), m);
                     checks += b as usize;
                     pos.undo_move();
                 }
