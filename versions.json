@@ -286,5 +286,13 @@
     "parent": "v35-seiran",
     "created": "2026-11-18T01:30:36Z",
     "description": "高速化: 王手判定を直前の手（直接・開き王手）だけから求める、pin 判定を手ごとの 1 方向に、NN 出力層を i16 積和（pmaddwd）に、NN 差分の特徴番号を表引きに、線形評価の全計算をビット走査に（命令数/ノード約 -21%、4 本同時 NPS 約 +23%）"
+  },
+  {
+    "number": 37,
+    "name": "usugumo",
+    "commit": "6563c765f6fe0330fa3550349d2297639ffafaf9",
+    "parent": "v36-tachibana",
+    "created": "2026-11-19T01:59:36Z",
+    "description": "高速化: LMP / futility で読まないと決まる静かな手を do_move の前に判定する（指す前の王手判定 gives_check を追加。探索木は v36 と同一、命令数 -13%、4 本同時 NPS 約 +12%）"
   }
 ]
